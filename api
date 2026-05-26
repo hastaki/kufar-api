@@ -1,0 +1,200 @@
+import requests
+import json
+import time
+import sqlite3
+import sys
+from datetime import datetime
+
+# ============= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =============
+def format_price(price_str):
+    try:
+        if not price_str or price_str == '0' or price_str == '0.0':
+            return "0"
+        price_str = str(price_str).strip()
+        try:
+            price = int(price_str) / 100
+            if price.is_integer():
+                price_int = int(price)
+                return f"{price_int:,}".replace(',', ' ')
+            else:
+                return f"{price:,.2f}".replace(',', ' ').replace('.00', '')
+        except:
+            pass
+        return price_str
+    except:
+        return "0"
+
+# ============= НАСТРОЙКИ =============
+TELEGRAM_TOKEN = "ВАШ_ТОКЕН"
+TELEGRAM_CHAT_ID = "ВАШ_CHAT_ID"
+CHECK_INTERVAL = 6000
+DB_FILE = "kufar.db"
+
+API_URL = "https://api.kufar.by/search-api/v2/search/rendered-paginated"
+API_PARAMS = {
+    "cat": "1080",
+    "cur": "USD",
+    "gtsy": "country-belarus~province-minskaja_oblast~area-dzerzhinskij_rajon",
+    "lang": "ru",
+    "prc": "r:0,15000",
+    "size": "100",
+    "typ": "sell"
+}
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
+
+# ============= БАЗА ДАННЫХ =============
+class Database:
+    def __init__(self):
+        self.conn = sqlite3.connect(DB_FILE)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ads (
+                ad_id INTEGER PRIMARY KEY,
+                title TEXT,
+                price_byn TEXT,
+                price_usd TEXT,
+                notified INTEGER DEFAULT 0,
+                added_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        self.conn.commit()
+
+    def ad_exists(self, ad_id):
+        self.cursor.execute("SELECT 1 FROM ads WHERE ad_id=?", (ad_id,))
+        return self.cursor.fetchone() is not None
+
+    def save_ad(self, ad):
+        self.cursor.execute('''
+            INSERT OR REPLACE INTO ads(ad_id,title,price_byn,price_usd,notified)
+            VALUES(?,?,?,?,0)
+        ''', (ad['ad_id'], ad['title'], ad['price_byn'], ad['price_usd']))
+        self.conn.commit()
+
+    def get_ad_prices(self, ad_id):
+        self.cursor.execute("SELECT price_byn, price_usd FROM ads WHERE ad_id=?", (ad_id,))
+        row = self.cursor.fetchone()
+        if row:
+            return row[0], row[1]
+        return None, None
+
+    def update_prices(self, ad_id, price_byn, price_usd):
+        self.cursor.execute(
+            "UPDATE ads SET price_byn=?, price_usd=? WHERE ad_id=?",
+            (price_byn, price_usd, ad_id)
+        )
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+# ============= KUFAR =============
+class KufarParser:
+    @staticmethod
+    def get_ads():
+        try:
+            r = requests.get(API_URL, params=API_PARAMS, headers=HEADERS, timeout=20)
+            return r.json()
+        except:
+            return None
+
+    @staticmethod
+    def parse_ad(ad_json):
+        ad_id = ad_json.get('ad_id')
+        if not ad_id:
+            return None
+
+        return {
+            'ad_id': ad_id,
+            'title': ad_json.get('subject', 'Без названия'),
+            'price_byn': format_price(ad_json.get('price_byn', '0')),
+            'price_usd': format_price(ad_json.get('price_usd', '0')),
+            'ad_url': f"https://re.kufar.by/vi/{ad_id}"
+        }
+
+# ============= TELEGRAM =============
+class TelegramBot:
+    def __init__(self, token, chat_id):
+        self.base_url = f"https://api.telegram.org/bot{token}"
+        self.chat_id = chat_id
+
+    def send_ad(self, ad):
+        text = self.format_message(ad)
+        url = f"{self.base_url}/sendMessage"
+        data = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False
+        }
+        r = requests.post(url, data=data)
+        return r.status_code == 200
+
+    def format_message(self, ad):
+        msg = f"🏠 <b>{ad['title']}</b>\n\n"
+
+        if 'price_change' in ad:
+            old_byn, old_usd = ad['price_change']
+            msg += "🔄 <b>Изменение цены!</b>\n"
+            msg += f"Было: {old_byn} BYN\n\n"
+
+        msg += f"💰 <b>{ad['price_byn']} BYN</b>\n"
+        if ad['price_usd'] != "0":
+            msg += f"(${ad['price_usd']} USD)\n"
+
+        msg += f"\n🔗 <a href='{ad['ad_url']}'>Открыть на Kufar</a>\n"
+        msg += f"🆔 {ad['ad_id']}"
+        return msg
+
+# ============= ОСНОВНОЙ ЦИКЛ =============
+def main():
+    db = Database()
+    parser = KufarParser()
+    bot = TelegramBot(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+
+    print("🚀 Мониторинг запущен")
+
+    try:
+        while True:
+            data = parser.get_ads()
+            if not data or 'ads' not in data:
+                time.sleep(60)
+                continue
+
+            for ad_json in data['ads']:
+                ad = parser.parse_ad(ad_json)
+                if not ad:
+                    continue
+
+                ad_id = ad['ad_id']
+
+                if not db.ad_exists(ad_id):
+                    db.save_ad(ad)
+                    print(f"✅ Новое объявление {ad_id}")
+                    bot.send_ad(ad)
+                    time.sleep(1)
+
+                else:
+                    old_byn, old_usd = db.get_ad_prices(ad_id)
+
+                    if old_byn != ad['price_byn'] or old_usd != ad['price_usd']:
+                        print(f"💸 Изменилась цена у {ad_id}")
+
+                        db.update_prices(ad_id, ad['price_byn'], ad['price_usd'])
+
+                        ad['price_change'] = (old_byn, old_usd)
+                        bot.send_ad(ad)
+                        time.sleep(1)
+
+            time.sleep(CHECK_INTERVAL)
+
+    except KeyboardInterrupt:
+        print("🛑 Остановка")
+    finally:
+        db.close()
+
+# ============= ЗАПУСК =============
+if __name__ == "__main__":
+    main()
